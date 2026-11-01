@@ -21,6 +21,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from .. import updater
 from ..config import default_config_path, load_config, setup_logging
 from .server import Controller, start_server
 
@@ -63,6 +64,13 @@ def _alert(text: str) -> None:
         ctypes.windll.user32.MessageBoxW(None, text, "lolbuilds", 0x40)
 
 
+def _cleanup_previous() -> None:
+    for _ in range(15):
+        if updater.cleanup_previous():
+            return
+        time.sleep(2)
+
+
 def serve_in_thread(ctrl: Controller, host: str, port: int) -> threading.Event:
     ready = threading.Event()
     errors: list[BaseException] = []
@@ -86,13 +94,49 @@ def serve_in_thread(ctrl: Controller, host: str, port: int) -> threading.Event:
     return ready
 
 
+def check_gui() -> int:
+    """Auto-test de la CI : la couche fenêtre (pywebview + pythonnet) se charge-t-elle dans l'exe construit ?
+
+    C'est exactement l'import qui plantait au démarrage (« Failed to resolve Python.Runtime.Loader.Initialize »).
+    Sans console, le résultat passe par le code de sortie et un fichier texte."""
+    import tempfile
+    import traceback
+
+    report = Path(tempfile.gettempdir()) / "lolbuilds-check-gui.txt"
+    try:
+        import webview  # noqa: F401
+        import webview.platforms.winforms  # noqa: F401  (importe pythonnet : le point qui plantait)
+    except BaseException:  # noqa: BLE001
+        report.write_text(traceback.format_exc(), encoding="utf-8")
+        return 1
+    report.write_text("ok", encoding="utf-8")
+    return 0
+
+
+def _start_server(ctrl: Controller, port: int, retry: bool) -> None:
+    """Démarre le serveur local ; après une mise à jour, l'ancien processus libère le port dans les secondes qui suivent."""
+    deadline = time.monotonic() + (20 if retry else 0)
+    while True:
+        try:
+            serve_in_thread(ctrl, "127.0.0.1", port)
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.5)
+
+
 def run(args: argparse.Namespace) -> int:
+    if args.check_gui:
+        return check_gui()
     cfg = load_config(args.config)
     setup_logging(cfg.cache_dir, "app", args.verbose)
+    # Supprime l'ancien exe laissé par la dernière mise à jour portable (il se libère après quelques secondes).
+    threading.Thread(target=_cleanup_previous, name="lolbuilds-cleanup", daemon=True).start()
     ctrl = Controller(cfg, demo=args.demo, demo_builds=args.demo_builds)
     url = f"http://127.0.0.1:{args.port}/"
     try:
-        serve_in_thread(ctrl, "127.0.0.1", args.port)
+        _start_server(ctrl, args.port, args.after_update)
     except OSError as exc:
         log.error("Port %d indisponible (%s) : l'application tourne peut-être déjà.", args.port, exc)
         if not args.browser:
@@ -129,6 +173,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                    help="vrai client League, mais avec les builds d'exemple (avant le premier prefetch)")
     p.add_argument("--browser", action="store_true", help="ouvre l'UI dans le navigateur")
     p.add_argument("--server-only", action="store_true", help="serveur seul, sans fenêtre")
+    p.add_argument("--check-gui", action="store_true", help="vérifie que la couche fenêtre se charge, puis quitte (CI)")
+    p.add_argument("--after-update", action="store_true", help=argparse.SUPPRESS)  # relance par la mise à jour portable
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 

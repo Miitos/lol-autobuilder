@@ -13,7 +13,7 @@
 | Fichier | Pour qui |
 |---|---|
 | `lolbuilds-setup-….exe` | **La plupart des joueurs** : installateur classique, sans droits administrateur |
-| `lolbuilds-portable-….zip` | Sans installation : décompresser puis lancer `lolbuilds.exe` |
+| `lolbuilds-portable-….exe` | Sans installation : un seul fichier à lancer, qui se met à jour tout seul |
 | `SHA256SUMS.txt` | Empreintes pour vérifier les fichiers |
 
 Windows 10 ou 11 (64 bits). Au premier lancement, si Windows affiche « Windows a protégé votre ordinateur », clique sur **Informations complémentaires** puis **Exécuter quand même** (l'application n'est pas signée).

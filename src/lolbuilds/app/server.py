@@ -15,6 +15,7 @@ import dataclasses
 import json
 import logging
 import os
+import sys
 import tempfile
 import time
 from datetime import date
@@ -145,7 +146,7 @@ class Controller:
             "counterPicks": None,  # bons picks contre l'adversaire de lane, avant le pick
             "banSuggestions": None,  # pendant la phase de bans : menaces pour mon champion ou tier list
             # Mise à jour (Réglages) : idle | checking | uptodate | available | downloading | installing | error
-            "update": {"status": "idle", "current": __version__, "installable": updater.installed()},
+            "update": {"status": "idle", "current": __version__, "installable": updater.mode() is not None, "mode": updater.mode()},
             "banPick": None,  # champion choisi pour mon ban depuis l'appli : {championId, locked}
             "team": None,  # pendant la partie : {status, players: [...]} (mon équipe, profils OP.GG)
         }
@@ -479,14 +480,21 @@ class Controller:
         upd = self.state["update"]
         if upd.get("status") != "available":
             return {"ok": False, "error": "Aucune mise à jour à installer"}
-        if not upd.get("installable"):
-            return {"ok": False, "error": "Version portable ou installée depuis les sources : télécharge la release sur GitHub"}
+        mode = updater.mode()
+        if mode is None:
+            return {"ok": False, "error": "Installation depuis les sources : télécharge la release sur GitHub"}
         upd["status"] = "downloading"
         await self.broadcast()
         try:
-            dest = Path(tempfile.gettempdir()) / "lolbuilds-update"
-            setup = await asyncio.to_thread(updater.download_installer, dict(upd), dest)
-            await asyncio.to_thread(updater.launch_installer, setup)
+            if mode == "installer":
+                dest = Path(tempfile.gettempdir()) / "lolbuilds-update"
+                setup = await asyncio.to_thread(updater.download_installer, dict(upd), dest)
+                await asyncio.to_thread(updater.launch_installer, setup)
+            else:
+                exe = Path(sys.executable)
+                new = await asyncio.to_thread(updater.download_portable, dict(upd), exe.parent)
+                await asyncio.to_thread(updater.swap_exe, exe, new)
+                await asyncio.to_thread(updater.relaunch, exe)
         except (updater.UpdateError, OSError) as exc:
             log.error("Mise à jour impossible : %s", exc)
             upd.update(status="error", error=str(exc))
@@ -494,7 +502,7 @@ class Controller:
             return {"ok": False, "error": str(exc)}
         upd["status"] = "installing"
         await self.broadcast()
-        # L'installateur remplace les fichiers de l'appli puis la relance : on lui laisse la place.
+        # L'installateur (ou le nouvel exe) remplace puis relance l'appli : on lui laisse la place.
         asyncio.get_running_loop().call_later(1.5, os._exit, 0)
         return {"ok": True}
 

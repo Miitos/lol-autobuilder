@@ -32,7 +32,7 @@ Clique sur **Informations complémentaires**, puis sur **Exécuter quand même**
 
 ### Version portable
 
-Tu préfères ne rien installer ? Télécharge **`lolbuilds-portable-….zip`**, décompresse-le où tu veux et lance `lolbuilds.exe`.
+Tu préfères ne rien installer ? Télécharge **`lolbuilds-portable-….exe`** : un seul fichier, à mettre où tu veux (clé USB, bureau…) et à lancer. Pas de zip à décompresser. Il se met à jour tout seul, comme la version installée.
 
 ## Utilisation
 
@@ -62,9 +62,9 @@ Au moment de l'installation, tu peux aussi cocher **Lancer lolbuilds au démarra
 
 Au démarrage, lolbuilds regarde s'il existe une nouvelle version. Si c'est le cas, une pastille apparaît sur **Réglages** : ouvre la section **Mise à jour** et clique sur **Mettre à jour**. L'installateur est téléchargé, vérifié, puis lolbuilds se ferme et se rouvre tout seul, réglages conservés.
 
-Avec la version portable, le bouton ouvre la page de téléchargement de la nouvelle version.
+La version portable se met à jour de la même façon : le nouvel exe est téléchargé à côté de l'ancien, vérifié, puis remplace l'ancien (le dossier où il se trouve doit donc être modifiable). Seule une installation depuis les sources ouvre la page de téléchargement.
 
-> Tu as la 0.1.0 ? Elle n'a pas encore ce bouton : installe la dernière version une fois depuis la [page des téléchargements](https://github.com/Miitos/lol-autobuilder/releases/latest), les suivantes arriveront toutes seules.
+> Tu as la 0.1.0 ou le zip portable de la 0.2.1 ? Ils n'ont pas ce bouton (le zip ne démarrait pas toujours) : installe la dernière version une fois depuis la [page des téléchargements](https://github.com/Miitos/lol-autobuilder/releases/latest), les suivantes arriveront toutes seules.
 
 ## Questions fréquentes
 
