@@ -22,7 +22,7 @@ src/lolbuilds/
     server.py                état du champ select, actions, WebSocket vers la page
     demo.py                  mode démo
     ui/                      HTML/CSS/JS, polices embarquées
-packaging/                   exe (PyInstaller), installateur (Inno Setup), icône, notes de version
+packaging/                   exe en dossier + exe portable seul (PyInstaller), installateur (Inno Setup), icône, notes de version
 .github/workflows/           tests à chaque push, build + release sur un tag vX.Y.Z
 install_task.ps1             tâches planifiées (installation depuis les sources)
 ```
@@ -99,8 +99,11 @@ En local :
 ```bash
 .venv\Scripts\pyinstaller --noconfirm --clean packaging\lolbuilds.spec
 ```
+```bash
+.venv\Scripts\pyinstaller --noconfirm --clean packaging\lolbuilds-portable.spec
+```
 
-L'exe est dans `dist\lolbuilds\lolbuilds.exe` (dossier complet, ~45 Mo). L'installateur se construit avec [Inno Setup 6](https://jrsoftware.org/isinfo.php) : `iscc /DAppVersion=0.1.0 packaging\installer.iss` (sortie dans `dist\installer\`). L'icône se régénère avec `python packaging\make_icon.py` (Pillow).
+L'exe en dossier est dans `dist\lolbuilds\lolbuilds.exe` (dossier complet, ~45 Mo) ; l'exe **portable** (un seul fichier) est `dist\lolbuilds-portable.exe`. `lolbuilds-portable.exe --check-gui` vérifie que la couche fenêtre se charge (code de sortie 0, détail dans `%TEMP%\lolbuilds-check-gui.txt`) : la CI le lance sur les deux exe avant de publier. L'installateur se construit avec [Inno Setup 6](https://jrsoftware.org/isinfo.php) : `iscc /DAppVersion=0.1.0 packaging\installer.iss` (sortie dans `dist\installer\`). L'icône se régénère avec `python packaging\make_icon.py` (Pillow).
 
 ## Publier une version
 
@@ -112,7 +115,7 @@ L'exe est dans `dist\lolbuilds\lolbuilds.exe` (dossier complet, ~45 Mo). L'insta
    ```bash
    git push origin main v0.2.0
    ```
-3. La CI (`.github/workflows/release.yml`) vérifie que le tag correspond à la version, lance les tests, construit l'exe, l'installateur, la version portable et les empreintes SHA-256, puis publie la release GitHub. Lancée à la main (onglet Actions), elle construit seulement et dépose les fichiers en artefacts.
+3. La CI (`.github/workflows/release.yml`) vérifie que le tag correspond à la version, lance les tests, construit l'exe, l'installateur, l'exe portable (et vérifie qu'ils démarrent) et les empreintes SHA-256, puis publie la release GitHub. Lancée à la main (onglet Actions), elle construit seulement et dépose les fichiers en artefacts.
 
 ## Limites connues
 
@@ -120,3 +123,7 @@ L'exe est dans `dist\lolbuilds\lolbuilds.exe` (dossier complet, ~45 Mo). L'insta
 - **Serveur MCP d'OP.GG** : service public sans clé, dont le format et la disponibilité peuvent changer. En cas d'erreur, les builds de la veille restent en cache.
 - **Endpoints LCU non officiels** : ils peuvent changer entre deux patchs. Chaque étape (runes, sorts, item set) est isolée et les erreurs sont loguées.
 - **Exe non signé** : Windows SmartScreen affiche un avertissement au premier lancement (voir le README).
+
+## Mise à jour automatique
+
+`updater.py` choisit le mode d'après l'exe en cours : **installé** (`unins000.exe` à côté) → l'installateur de la release est lancé en silencieux ; **portable** (exe seul) → le nouvel exe est téléchargé dans le même dossier, vérifié (SHA-256 de `SHA256SUMS.txt`), puis échangé avec l'exe en cours (Windows interdit de l'écraser mais accepte de le renommer : l'ancien devient `lolbuilds-portable-….exe.old`, supprimé au démarrage suivant) et relancé avec `--after-update`, qui attend que l'ancien processus libère le port. Depuis les sources : pas de mise à jour automatique. Les assets de la release sont reconnus par leur nom (`lolbuilds-setup-*.exe`, `lolbuilds-portable-*.exe`, `SHA256SUMS.txt`).

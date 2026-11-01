@@ -10,12 +10,15 @@ import pytest
 from lolbuilds import updater
 
 SETUP = b"MZ faux installateur"
+PORTABLE = b"MZ faux exe portable"
 
 
-def github(tag: str = "v0.2.0", setup: bytes = SETUP, sums_hash: str | None = None, with_installer: bool = True):
+def github(tag: str = "v0.2.0", setup: bytes = SETUP, sums_hash: str | None = None, with_installer: bool = True,
+           portable: bytes = PORTABLE, portable_hash: str | None = None):
     digest = sums_hash or hashlib.sha256(setup).hexdigest()
+    portable_digest = portable_hash or hashlib.sha256(portable).hexdigest()
     assets = [{"name": "SHA256SUMS.txt", "browser_download_url": "https://dl/SHA256SUMS.txt"},
-              {"name": "lolbuilds-portable-0.2.0.zip", "browser_download_url": "https://dl/portable.zip"}]
+              {"name": "lolbuilds-portable-0.2.0.exe", "browser_download_url": "https://dl/portable.exe"}]
     if with_installer:
         assets.append({"name": "lolbuilds-setup-0.2.0.exe", "browser_download_url": "https://dl/setup.exe"})
 
@@ -24,7 +27,9 @@ def github(tag: str = "v0.2.0", setup: bytes = SETUP, sums_hash: str | None = No
             return httpx.Response(200, json={"tag_name": tag, "body": "Nouveautés", "assets": assets,
                                              "html_url": "https://github.com/Miitos/lol-autobuilder/releases/tag/" + tag})
         if request.url.path == "/SHA256SUMS.txt":
-            return httpx.Response(200, text=f"{digest}  lolbuilds-setup-0.2.0.exe\nabc  lolbuilds-portable-0.2.0.zip\n")
+            return httpx.Response(200, text=f"{digest}  lolbuilds-setup-0.2.0.exe\n{portable_digest}  lolbuilds-portable-0.2.0.exe\n")
+        if request.url.path == "/portable.exe":
+            return httpx.Response(200, content=portable)
         if request.url.path == "/setup.exe":
             return httpx.Response(200, content=setup)
         return httpx.Response(404)
@@ -76,3 +81,61 @@ def test_release_without_installer(tmp_path):
 
 def test_not_installed_from_sources():
     assert updater.installed() is False  # tests lancés depuis les sources, pas depuis l'exe installé
+
+
+def test_check_finds_portable_exe():
+    info = updater.check("0.1.0", http=github())
+    assert info["portable"]["name"] == "lolbuilds-portable-0.2.0.exe"
+
+
+def test_download_portable_verified(tmp_path):
+    client = github()
+    path = updater.download_portable(updater.check("0.1.0", http=client), tmp_path, http=client)
+    assert path.read_bytes() == PORTABLE and path.parent == tmp_path
+
+
+def test_download_portable_rejects_wrong_checksum(tmp_path):
+    client = github(portable_hash="0" * 64)
+    with pytest.raises(updater.UpdateError, match="empreinte"):
+        updater.download_portable(updater.check("0.1.0", http=client), tmp_path, http=client)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_portable_rejects_non_exe(tmp_path):
+    client = github(portable=b"<html>pas un exe</html>")
+    with pytest.raises(updater.UpdateError, match="exécutable"):
+        updater.download_portable(updater.check("0.1.0", http=client), tmp_path, http=client)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_release_without_portable(tmp_path):
+    client = github()
+    info = updater.check("0.1.0", http=client)
+    info["portable"] = None
+    with pytest.raises(updater.UpdateError):
+        updater.download_portable(info, tmp_path, http=client)
+
+
+def test_swap_exe_keeps_old_as_dot_old(tmp_path):
+    current, new = tmp_path / "lolbuilds.exe", tmp_path / "update.download"
+    current.write_bytes(b"MZ ancien")
+    new.write_bytes(b"MZ nouveau")
+    updater.swap_exe(current, new)
+    assert current.read_bytes() == b"MZ nouveau"
+    assert (tmp_path / "lolbuilds.exe.old").read_bytes() == b"MZ ancien" and not new.exists()
+    # une mise à jour suivante écrase l'ancien .old
+    new.write_bytes(b"MZ encore plus recent")
+    updater.swap_exe(current, new)
+    assert (tmp_path / "lolbuilds.exe.old").read_bytes() == b"MZ nouveau"
+
+
+def test_swap_exe_restores_on_failure(tmp_path):
+    current = tmp_path / "lolbuilds.exe"
+    current.write_bytes(b"MZ ancien")
+    with pytest.raises(OSError):
+        updater.swap_exe(current, tmp_path / "absent")
+    assert current.read_bytes() == b"MZ ancien"
+
+
+def test_no_automatic_update_from_sources():
+    assert updater.mode() is None and updater.cleanup_previous() is True
