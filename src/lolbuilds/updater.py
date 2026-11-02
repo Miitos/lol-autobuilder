@@ -43,18 +43,33 @@ def parse_version(text: str) -> tuple[int, ...]:
     return tuple(int(n) for n in re.findall(r"\d+", text.split("-")[0])[:3]) or (0,)
 
 
+def _in_program_files() -> bool:
+    """Exe sous Program Files (ancienne installation « tous les utilisateurs ») : ni l'installateur non élevé ni
+    l'échange d'exe n'y marchent, la mise à jour reste manuelle (page de la release)."""
+    exe = os.path.normcase(os.path.abspath(sys.executable))
+    for var in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        root = os.environ.get(var)
+        if root:
+            root = os.path.normcase(os.path.abspath(root))
+            if exe == root or exe.startswith(root + os.sep):
+                return True
+    return False
+
+
 def installed() -> bool:
     """Exe installé par l'installateur (et donc remplaçable par une nouvelle version de celui-ci)."""
-    return bool(getattr(sys, "frozen", False)) and (Path(sys.executable).parent / "unins000.exe").exists()
+    return (bool(getattr(sys, "frozen", False)) and (Path(sys.executable).parent / "unins000.exe").exists()
+            and not _in_program_files())
 
 
 def portable() -> bool:
     """Exe portable : un exe seul (PyInstaller), qui ne vient pas de l'installateur."""
-    return bool(getattr(sys, "frozen", False)) and not installed()
+    return (bool(getattr(sys, "frozen", False)) and not (Path(sys.executable).parent / "unins000.exe").exists()
+            and not _in_program_files())
 
 
 def mode() -> str | None:
-    """`installer`, `portable` ou None (depuis les sources : pas de mise à jour automatique)."""
+    """`installer`, `portable` ou None (sources ou Program Files : pas de mise à jour automatique)."""
     return "installer" if installed() else "portable" if portable() else None
 
 
@@ -107,12 +122,16 @@ def _download(asset: dict[str, str] | None, sums_url: str | None, dest: Path, wh
         dest.mkdir(parents=True, exist_ok=True)
         path = dest / (name or asset["name"])
         digest = hashlib.sha256()
-        with client.stream("GET", asset["url"]) as resp:
-            resp.raise_for_status()
-            with path.open("wb") as f:
-                for chunk in resp.iter_bytes():
-                    digest.update(chunk)
-                    f.write(chunk)
+        try:
+            with client.stream("GET", asset["url"]) as resp:
+                resp.raise_for_status()
+                with path.open("wb") as f:
+                    for chunk in resp.iter_bytes():
+                        digest.update(chunk)
+                        f.write(chunk)
+        except BaseException:  # fichier partiel : on ne le laisse pas traîner
+            path.unlink(missing_ok=True)
+            raise
     except httpx.HTTPError as exc:
         raise UpdateError(f"téléchargement impossible ({exc})") from exc
     finally:

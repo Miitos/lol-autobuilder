@@ -50,7 +50,7 @@ def test_merge_item_sets_keeps_user_sets():
         {"title": "[Auto] Thresh Support 15.20", "uid": "old"},
     ]}
     merged = merge_item_sets(existing, {"title": "[Auto] Ahri Mid 15.21", "uid": "new"})
-    assert [s["uid"] for s in merged["itemSets"]] == ["u1", "new"]
+    assert [s["uid"] for s in merged["itemSets"]] == ["new", "u1"]  # le nôtre en premier : présélectionné en jeu
     assert merged["accountId"] == 1 and existing["itemSets"][1]["uid"] == "old"  # entrée non mutée
 
 
@@ -79,7 +79,7 @@ def test_apply_full_flow():
     patch = next(b for m, p, b in lcu.calls if m == "PATCH")
     assert patch == {"spell1Id": 4, "spell2Id": 14}
     put = next(b for m, p, b in lcu.calls if m == "PUT")
-    assert [s["title"] for s in put["itemSets"]] == ["Perso", "[Auto] Ahri Mid"]
+    assert [s["title"] for s in put["itemSets"]] == ["[Auto] Ahri Mid", "Perso"]
 
 
 def test_disabled_steps_are_skipped():
@@ -135,3 +135,11 @@ def test_lcu_body_is_compact_utf8():
 
     raw = encode_body({"title": "Départ", "n": [1, 2]})
     assert raw == '{"title":"Départ","n":[1,2]}'.encode("utf-8")
+
+
+def test_our_item_set_outranks_the_others():
+    existing = {"itemSets": [{"title": "Blitz Ahri", "uid": "a", "sortrank": 7}, {"title": "Vieux set", "uid": "b"},
+                             {"title": "[Auto] ancien", "uid": "c", "sortrank": 99}]}
+    merged = merge_item_sets(existing, {"title": "[Auto] Ahri Mid", "uid": "new", "sortrank": 0})
+    assert [s["uid"] for s in merged["itemSets"]] == ["new", "a", "b"]
+    assert merged["itemSets"][0]["sortrank"] == 8 and merged["itemSets"][1]["sortrank"] == 7  # les autres intacts

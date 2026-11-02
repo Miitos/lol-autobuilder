@@ -19,7 +19,6 @@ DefaultDirName={autopf}\lolbuilds
 DefaultGroupName=lolbuilds
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
 OutputDir=..\dist\installer
 OutputBaseFilename=lolbuilds-setup-{#AppVersion}
 SetupIconFile=lolbuilds.ico
@@ -57,7 +56,12 @@ Name: "{userstartup}\lolbuilds"; Filename: "{app}\lolbuilds.exe"; Tasks: startup
 [Run]
 Filename: "{app}\lolbuilds.exe"; Description: "{cm:LaunchNow}"; Flags: nowait postinstall skipifsilent
 ; Mise à jour depuis l'appli (installateur lancé en silencieux) : on rouvre lolbuilds automatiquement.
-Filename: "{app}\lolbuilds.exe"; Flags: nowait skipifnotsilent
+Filename: "{app}\lolbuilds.exe"; Parameters: "--after-update"; Flags: nowait skipifnotsilent
+
+[UninstallRun]
+; lolbuilds ouvert pendant la désinstallation : on le ferme, sinon l'exe et son dossier restent.
+; (Pas d'AppMutex : la mise à jour silencieuse démarre l'installateur avant que l'appli ait quitté, il s'arrêterait.)
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM lolbuilds.exe"; Flags: runhidden; RunOnceId: "CloseLolbuilds"
 
 [UninstallDelete]
 ; Les builds en cache et les réglages (%USERPROFILE%\.lolbuilds) sont conservés volontairement.

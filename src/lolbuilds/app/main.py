@@ -16,6 +16,7 @@ import os
 import sys
 import threading
 import time
+import tomllib
 import urllib.request
 import webbrowser
 from collections.abc import Sequence
@@ -23,8 +24,8 @@ from pathlib import Path
 from typing import Any
 
 from .. import updater
-from ..config import default_config_path, load_config, setup_logging
-from .server import Controller, start_server
+from ..config import Config, default_config_path, load_config, setup_logging
+from .server import UI_DIR, Controller, start_server
 from .winstate import fullscreen_app_active
 
 log = logging.getLogger("lolbuilds.app")
@@ -188,6 +189,9 @@ def serve_in_thread(ctrl: Controller, host: str, port: int) -> threading.Event:
     return ready
 
 
+REQUIRED_UI_FILES = ("index.html", "audio/yume-no-mukou-e.mp3", "fonts/fonts.css")
+
+
 def check_gui() -> int:
     """Auto-test de la CI : la couche fenêtre (pywebview + pythonnet) se charge-t-elle dans l'exe construit ?
 
@@ -202,6 +206,11 @@ def check_gui() -> int:
         import webview.platforms.winforms  # noqa: F401  (importe pythonnet : le point qui plantait)
     except BaseException:  # noqa: BLE001
         report.write_text(traceback.format_exc(), encoding="utf-8")
+        return 1
+    # Données embarquées : un exe sans interface ou sans polices démarrerait quand même, mais vide.
+    missing = [rel for rel in REQUIRED_UI_FILES if not (UI_DIR / rel).is_file()]
+    if missing:
+        report.write_text(f"fichiers d'interface manquants dans {UI_DIR} : {', '.join(missing)}", encoding="utf-8")
         return 1
     report.write_text("ok", encoding="utf-8")
     return 0
@@ -253,8 +262,19 @@ def _start_on_free_port(ctrl: Controller, port: int) -> int | None:
 def run(args: argparse.Namespace) -> int:
     if args.check_gui:
         return check_gui()
-    cfg = load_config(args.config)
-    setup_logging(cfg.cache_dir, "app", args.verbose)
+    try:
+        cfg = load_config(args.config)
+    except (tomllib.TOMLDecodeError, ValueError, OSError) as exc:
+        # Sans console, l'exe fenêtré mourrait sans rien dire : on prévient et on démarre avec les réglages par défaut.
+        cfg = Config()
+        try:
+            setup_logging(cfg.cache_dir, "app", args.verbose)
+        except Exception:  # noqa: BLE001
+            pass
+        log.error("config.toml invalide (%s) : réglages par défaut", exc)
+        _alert(f"config.toml invalide : {exc}\n\nlolbuilds démarre avec les réglages par défaut.")
+    else:
+        setup_logging(cfg.cache_dir, "app", args.verbose)
     # Supprime l'ancien exe laissé par la dernière mise à jour portable (il se libère après quelques secondes).
     threading.Thread(target=_cleanup_previous, name="lolbuilds-cleanup", daemon=True).start()
     ctrl = Controller(cfg, demo=args.demo, demo_builds=args.demo_builds)
@@ -271,6 +291,13 @@ def run(args: argparse.Namespace) -> int:
             if args.browser:
                 webbrowser.open(f"http://127.0.0.1:{port}/")
             return 0
+        # Une instance déjà lancée sur un port de repli ? On la ramène devant plutôt que d'en ouvrir une seconde.
+        for candidate in range(port + 1, port + 1 + PORT_FALLBACKS):
+            if _existing_instance(candidate) is not False:
+                log.info("lolbuilds tourne déjà sur le port %d : on ramène sa fenêtre", candidate)
+                if args.browser:
+                    webbrowser.open(f"http://127.0.0.1:{candidate}/")
+                return 0
         # Port pris par autre chose (souvent une plage réservée par Windows avec Hyper-V, WSL ou Docker) : un autre.
         free = _start_on_free_port(ctrl, port)
         if free is None:

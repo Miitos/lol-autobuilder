@@ -528,6 +528,7 @@ def test_aram_option_off_keeps_the_ranked_behaviour(tmp_path, monkeypatch):
 
 
 def test_ranked_gets_the_aram_build_as_last_atypical_proposal(ctrl):
+    ctrl.prefs.update({"atypical": True})
     ctrl.live.source.aram_perk = 8229
     run(ctrl, ahri_vs([134]))
     variants = ctrl.state["current"]["build"]["variants"]
@@ -538,6 +539,7 @@ def test_ranked_gets_the_aram_build_as_last_atypical_proposal(ctrl):
 
 
 def test_atypical_proposal_skipped_when_identical_to_the_ranked_build(ctrl):
+    ctrl.prefs.update({"atypical": True})
     run(ctrl, ahri_vs([134]))  # build ARAM de la fausse source = build classé
     tags = [v["tags"][0] for v in ctrl.state["current"]["build"]["variants"]]
     assert "Atypique : build ARAM" not in tags
@@ -705,15 +707,16 @@ def test_disco_pick_is_off_by_default(ctrl):
     assert not asyncio.run(ctrl.disco_roll())["ok"]
 
 
-def test_disco_roll_hovers_a_free_champion(ctrl):
+def test_disco_roll_draws_a_free_champion_without_hovering(ctrl):
     ctrl.prefs.update({"disco": {"enabled": True}})
     asyncio.run(ctrl.on_session(pick_phase()))
     ctrl.lcu.calls.clear()
     r = asyncio.run(ctrl.disco_roll())
     assert r["ok"] and r["championId"] in (103, 80)  # ni Thresh (allié) ni Syndra (ennemie)
     assert r["championId"] in r["reel"] and not {412, 134} & set(r["reel"])
-    assert ("PATCH", "/lol-champ-select/v1/session/actions/21", {"championId": r["championId"]}) in ctrl.lcu.calls
-    assert ctrl.state["current"]["championId"] == r["championId"]  # son build s'affiche pendant la roulette
+    assert not any(m == "PATCH" for m, *_ in ctrl.lcu.calls)  # rien dans le client avant la fin de la roulette
+    assert ctrl.state["current"]["championId"] == r["championId"]  # son build se prépare pendant la roulette
+    assert 25000 < r["timeLeft"] <= 30000  # la roulette s'adapte au temps restant
 
 
 def test_disco_roll_refused_outside_my_pick(ctrl):
@@ -768,3 +771,275 @@ def test_disco_music_is_the_players_file(ctrl):
     (ctrl.cfg.cache_dir / "disco-music.mp3").write_bytes(b"ID3")
     (ctrl.cfg.cache_dir / "disco-music.txt").write_text("pas de la musique")
     assert ctrl._settings()["disco"]["music"] == "disco-music.mp3"
+
+
+# --------------------------------------------------------------------------- ARAM : partie et Disco pick
+
+def test_live_players_waits_while_the_game_loads():
+    """Écran de chargement : l'API répond 404 avec un JSON d'erreur, jamais pris pour la liste des joueurs."""
+    import httpx
+
+    from lolbuilds import players
+
+    def loading(_req):
+        return httpx.Response(404, json={"errorCode": "RESOURCE_NOT_FOUND", "httpStatus": 404})
+
+    with httpx.Client(transport=httpx.MockTransport(loading)) as http, pytest.raises(httpx.HTTPError):
+        players.live_players(http)
+
+    def loaded(req):
+        if req.url.path.endswith("activeplayername"):
+            return httpx.Response(200, json="Moi#EUW")
+        return httpx.Response(200, json=[{"riotId": "Moi#EUW", "team": "ORDER"}, "intrus"])
+
+    with httpx.Client(transport=httpx.MockTransport(loaded)) as http:
+        assert players.live_players(http) == ("Moi#EUW", [{"riotId": "Moi#EUW", "team": "ORDER"}])
+
+
+def test_aram_team_is_shown_without_positions(ctrl, monkeypatch):
+    from lolbuilds import players
+
+    everyone = [
+        {"riotId": "Moi#EUW", "team": "ORDER", "position": "", "rawChampionName": "game_character_displayname_Ahri"},
+        {"riotId": "Pote#123", "team": "ORDER", "position": "", "rawChampionName": "game_character_displayname_Thresh"},
+        {"riotId": "Ennemi#1", "team": "CHAOS", "position": "", "rawChampionName": "game_character_displayname_Syndra"},
+        {"riotId": "", "summonerName": "", "isBot": True, "team": "CHAOS", "position": "",
+         "rawChampionName": "game_character_displayname_Pantheon"},
+    ]
+    monkeypatch.setattr(players, "live_players", lambda: ("Moi#EUW", everyone))
+    monkeypatch.setattr(ctrl.live, "player_profile", lambda name, tag, region: PROFILE)
+
+    async def scenario():
+        ctrl.state["phase"] = "ChampSelect"
+        await ctrl.on_session(aram_session())
+        await ctrl.on_session(None)  # fin du champ select : le build reste affiché
+        ctrl.state["phase"] = "GameStart"
+        ctrl.on_phase("GameStart")  # chargement de la partie : les joueurs arrivent déjà
+        await ctrl._team_task
+
+    asyncio.run(scenario())
+    team = ctrl.state["team"]
+    assert team["status"] == "ok"
+    assert [p["riotId"] for p in team["players"]] == ["Moi#EUW", "Pote#123"]
+    assert [p["status"] for p in team["enemies"]] == ["ok", "bot"]
+    assert not any(t["text"].startswith("Peu joué") for t in team["players"][1]["tags"])  # champion tiré au sort
+    assert ctrl.state["current"]["championId"] == 103
+
+
+def test_team_never_stays_loading_after_an_error(ctrl, monkeypatch):
+    from lolbuilds import players
+
+    monkeypatch.setattr(players, "live_players", lambda: ("Moi#EUW", [{"riotId": "Moi#EUW", "team": "ORDER"}]))
+    monkeypatch.setattr(players, "riot_id", lambda p: 1 / 0)
+
+    async def scenario():
+        ctrl.on_phase("InProgress")
+        await ctrl._team_task
+
+    asyncio.run(scenario())
+    assert ctrl.state["team"]["status"] == "unavailable"
+
+
+def test_no_disco_pick_in_aram(ctrl):
+    ctrl.prefs.update({"disco": {"enabled": True}})
+    s = aram_session()
+    s["actions"] = [[{"id": 21, "actorCellId": 2, "type": "pick", "championId": 103, "completed": False, "isInProgress": True}]]
+    s["timer"] = {"phase": "BAN_PICK", "adjustedTimeLeftInPhase": 30000}
+    asyncio.run(ctrl.on_session(s))
+    assert not asyncio.run(ctrl.disco_roll())["ok"]
+    assert not asyncio.run(ctrl.disco_lock(103, 0, None))["ok"]
+    assert not any(m == "PATCH" for m, *_ in ctrl.lcu.calls)
+
+
+def test_aram_detected_from_the_map(ctrl):
+    """Abîme hurlant (carte 12) = ARAM ; le banc seul (ARURF, sur la Faille) ne suffit plus."""
+    async def gameflow(map_id):
+        async def request(method, path, body=None):
+            if path == "/lol-gameflow/v1/session":
+                return 200, {"map": {"id": map_id}}
+            return await FakeLcu().request(method, path, body)
+        ctrl.lcu.request = request
+        await ctrl.on_session(aram_session())  # session reçue avant la carte
+        await ctrl.on_event({"uri": "/lol-gameflow/v1/gameflow-phase", "data": "ChampSelect"})
+
+    asyncio.run(gameflow(11))
+    assert ctrl.state["champSelect"]["mode"] == "classic" and ctrl.state["current"]["mode"] == "classic"
+    asyncio.run(gameflow(12))
+    assert ctrl.state["champSelect"]["mode"] == "aram" and ctrl.state["current"]["mode"] == "aram"
+
+
+# --------------------------------------------------------------------------- application : concurrence
+
+def test_manual_apply_cancels_the_pending_auto_apply(ctrl, monkeypatch):
+    monkeypatch.setattr(server, "APPLY_DEBOUNCE", 0.05)
+
+    async def scenario():
+        await ctrl.on_session(ahri_vs([134]))
+        await ctrl._live_refresh()  # programme l'application automatique
+        pending = ctrl._apply_task
+        await ctrl.apply(1)  # choix manuel avant la fin de l'attente
+        await asyncio.sleep(0.1)
+        return pending
+
+    pending = asyncio.run(scenario())
+    assert pending.cancelled()
+    assert ctrl.state["applied"]["variant"] == 1 and not ctrl.state["applied"]["auto"]
+
+
+def test_busy_is_reset_when_the_apply_fails(ctrl, monkeypatch):
+    from lolbuilds.app.applier import BuildApplier
+
+    async def boom(self, lcu, build):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(BuildApplier, "apply", boom)
+
+    async def scenario():
+        await ctrl.on_session(ahri_vs([134]))
+        await ctrl._live_refresh()
+        if ctrl._apply_task:
+            await asyncio.gather(ctrl._apply_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert ctrl.state["busy"] is False and not ctrl._applying
+
+
+def test_applies_never_overlap(ctrl, monkeypatch):
+    from lolbuilds.app.applier import BuildApplier
+
+    running, overlaps = [0], []
+
+    async def slow(self, lcu, build):
+        running[0] += 1
+        overlaps.append(running[0])
+        await asyncio.sleep(0.02)
+        running[0] -= 1
+        self.problems = {}
+        return {"runes": True, "spells": True, "itemSet": True}
+
+    monkeypatch.setattr(BuildApplier, "apply", slow)
+
+    async def scenario():
+        await ctrl.on_session(ahri_vs([134]))
+        await ctrl._live_refresh()
+        await asyncio.gather(ctrl.apply(0), ctrl.apply(1), ctrl.apply(0))
+
+    asyncio.run(scenario())
+    assert max(overlaps) == 1
+
+
+def test_live_refresh_survives_an_opgg_failure(ctrl, monkeypatch):
+    def down(*_a, **_k):
+        raise RuntimeError("OP.GG en panne")
+
+    monkeypatch.setattr(ctrl.live, "matchup", down)
+    run(ctrl, ahri_vs([134]))
+    cur = ctrl.state["current"]
+    assert cur["opponent"]["status"] == "empty" and not cur["fetching"]
+    assert ctrl.state["applied"] is not None  # le build global est quand même appliqué
+
+
+def test_bad_requests_get_a_400(ctrl):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def scenario():
+        async with TestClient(TestServer(server.make_app(ctrl))) as client:
+            r = await client.post("/api/ban", data="pas du json")
+            return r.status
+
+    assert asyncio.run(scenario()) == 400
+
+
+# --------------------------------------------------------------------------- Disco pick : verrouillage
+
+def test_disco_safety_lock_before_the_timer_ends(ctrl, monkeypatch):
+    """Page fermée pendant la roulette : le champion tiré est verrouillé juste avant la fin du minuteur."""
+    monkeypatch.setattr(server, "DISCO_GUARD", 29.9)  # minuteur de 30 s : le secours part tout de suite
+    ctrl.prefs.update({"disco": {"enabled": True}})
+
+    async def scenario():
+        await ctrl.on_session(pick_phase())
+        r = await ctrl.disco_roll()
+        await ctrl._disco_guard
+        again = await ctrl.disco_lock(r["championId"], 0, None)  # la page arrive après : déjà fait
+        return r, again
+
+    r, again = asyncio.run(scenario())
+    locks = [c for c in ctrl.lcu.calls if c[0] == "PATCH" and c[1].endswith("/actions/21")]
+    assert locks == [("PATCH", "/lol-champ-select/v1/session/actions/21", {"championId": r["championId"], "completed": True})]
+    assert again["ok"]
+
+
+# --------------------------------------------------------------------------- partie normale : cas limites
+
+def my_pick(champion_id, completed):
+    s = ahri_vs([134])
+    s["myTeam"][1]["championId"] = champion_id
+    s["actions"] = [[{"id": 21, "actorCellId": 2, "type": "pick", "championId": champion_id, "completed": completed,
+                      "isInProgress": not completed}]]
+    s["timer"] = {"phase": "BAN_PICK", "adjustedTimeLeftInPhase": 30000}
+    return s
+
+
+def test_hover_during_my_turn_is_not_a_lock(ctrl):
+    run(ctrl, my_pick(103, completed=False))
+    assert ctrl.state["current"]["locked"] is False and ctrl.state["applied"] is None
+    run(ctrl, my_pick(103, completed=True))
+    assert ctrl.state["current"]["locked"] is True and ctrl.state["applied"] is not None
+
+
+def test_champion_trade_applies_the_new_champion(ctrl):
+    run(ctrl, ahri_vs([134]))
+    asyncio.run(ctrl.apply(1))  # choix manuel sur Ahri
+    traded = ahri_vs([134])
+    traded["myTeam"][1]["championId"] = 80  # échange avec un allié : Pantheon
+    ctrl.lcu.calls.clear()
+    run(ctrl, traded)
+    assert ctrl.state["current"]["championId"] == 80
+    assert any(p == "/lol-perks/v1/pages" and m == "POST" for m, p, _ in ctrl.lcu.calls)
+
+
+def test_browsing_another_role_never_replaces_the_applied_build(ctrl):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    run(ctrl, ahri_vs([134]))
+    ctrl.lcu.calls.clear()
+
+    async def scenario():
+        async with TestClient(TestServer(server.make_app(ctrl))) as client:
+            await client.post("/api/open", json={"championId": 103, "role": "top"})
+        await ctrl.on_session(ahri_vs([134]))
+        await ctrl._live_refresh()
+        if ctrl._apply_task:
+            await asyncio.gather(ctrl._apply_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert not any(m in ("POST", "PUT") for m, *_ in ctrl.lcu.calls)
+
+
+def test_failed_matchup_is_retried_later(ctrl, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ctrl.live, "matchup", lambda *a: calls.append(a) or [])
+    run(ctrl, ahri_vs([134]))
+    asyncio.run(ctrl._live_refresh())
+    assert len(calls) == 1 and ctrl.state["current"]["opponent"]["status"] == "empty"
+    monkeypatch.setattr(server, "MATCHUP_RETRY", 0)
+    asyncio.run(ctrl._live_refresh())
+    assert len(calls) == 2
+
+
+def test_arena_is_shown_but_never_applied(ctrl):
+    ctrl._map_id = 30
+    s = session(103, position="")
+    run(ctrl, s)
+    assert ctrl.state["champSelect"]["mode"] == "other"
+    assert ctrl.state["applied"] is None and not any(m == "POST" for m, *_ in ctrl.lcu.calls)
+
+
+def test_atypical_proposal_is_off_by_default(ctrl):
+    ctrl.live.source.aram_perk = 8229
+    assert ctrl.prefs.data["atypical"] is False
+    run(ctrl, ahri_vs([134]))
+    tags = [v["tags"][0] for v in ctrl.state["current"]["build"]["variants"]]
+    assert not any(t.startswith("Atypique") for t in tags)
+    assert "build Ahri aram" not in ctrl.live.source.calls  # aucune requête ARAM en plus

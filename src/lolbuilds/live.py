@@ -18,6 +18,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from datetime import date
 from itertools import permutations
 from pathlib import Path
@@ -38,6 +39,8 @@ log = logging.getLogger(__name__)
 # Profils des 10 joueurs : une requête OP.GG prend plusieurs secondes, on en lance quelques-unes en même temps,
 # chacune sur sa propre session (le client n'est pas partagé entre threads).
 PLAYER_SESSIONS = 5
+PLAYER_TTL = 600.0  # secondes : un profil/une liste de parties ne reste pas en mémoire plus de 10 min
+STALE_RETRY = 300.0  # secondes entre deux tentatives quand OP.GG est tombé et qu'on sert les rôles de la veille
 
 
 def guess_lanes(enemies: list[str], roles: dict[str, dict[str, float]]) -> dict[str, str]:
@@ -62,24 +65,31 @@ class LiveBuilds:
         self._static: StaticData | None = source.static if source else None
         self._lock = threading.Lock()  # le client OP.GG n'est pas partagé entre threads
         self._roles: dict[str, dict[str, float]] | None = None
-        self._profiles: dict[tuple[str, str, str], Any] = {}
-        self._matches: dict[tuple[str, str, str], Any] = {}
+        # (instant monotonic, valeur) : les profils expirent après PLAYER_TTL
+        self._profiles: dict[tuple[str, str, str], tuple[float, Any]] = {}
+        self._matches: dict[tuple[str, str, str], tuple[float, Any]] = {}
         self._player_clients: queue.Queue[OpggClient] | None = None
         self._roles_date = ""
+        self._roles_retry_at = 0.0  # après un échec avec rôles périmés, on ne retente qu'après ce délai
 
     # ------------------------------------------------------------------ données statiques
 
     def refresh_static(self) -> bool:
         """Data Dragon + images de l'interface (une fois au démarrage). True si quelque chose a changé."""
         dd = DataDragon(self.dir)
-        previous = self._static or dd.load_cached()
-        before = previous.version if previous else None
+        assets = AssetStore(self.dir)
         try:
-            static = dd.ensure()
-            AssetStore(self.dir).ensure(static.version)
-        except Exception as exc:
-            log.warning("Données du jeu non mises à jour : %s", exc)
-            static = dd.load_cached()
+            previous = self._static or dd.load_cached()
+            before = previous.version if previous else None
+            try:
+                static = dd.ensure()
+                assets.ensure(static.version)
+            except Exception as exc:
+                log.warning("Données du jeu non mises à jour : %s", exc)
+                static = dd.load_cached()
+        finally:
+            dd.close()
+            assets.close()
         if static:
             self._static = static
             if self._source:
@@ -106,19 +116,40 @@ class LiveBuilds:
         today = date.today().isoformat()
         path = self.dir / "opgg" / "lanes.json"
         with self._lock:
-            if self._roles is None or self._roles_date != today:
-                cached = _read(path)
-                if cached and cached.get("date") == today:
-                    self._roles = cached["roles"]
-                else:
-                    self._roles = self.source.roles()
-                    _write(path, {"date": today, "roles": self._roles})
-                self._roles_date = today
+            if self._roles is not None and self._roles_date == today:
+                return self._roles
+            if self._roles is not None and time.monotonic() < self._roles_retry_at:
+                return self._roles  # rôles de la veille déjà servis, OP.GG vient d'échouer
+            cached = _read(path) or {}
+            stored = cached.get("roles")
+            stored = stored if isinstance(stored, dict) else None
+            if stored and cached.get("date") == today:
+                self._roles, self._roles_date = stored, today
+                return self._roles
+            try:
+                fresh = self.source.roles()
+            except BuildSourceError as exc:
+                if not stored:
+                    raise
+                # Rôles de la veille : mieux que rien pour deviner l'adversaire.
+                log.warning("OP.GG : rôles indisponibles (%s), rôles du %s utilisés", exc, cached.get("date"))
+                self._roles, self._roles_retry_at = stored, time.monotonic() + STALE_RETRY
+                return self._roles
+            if fresh:  # jamais d'écriture d'un résultat vide : il écraserait les rôles de la veille
+                _write(path, {"date": today, "roles": fresh})
+            self._roles, self._roles_date, self._roles_retry_at = fresh, today, 0.0
             return self._roles
+
+    def _roles_or_empty(self) -> dict[str, dict[str, float]]:
+        try:
+            return self.roles()
+        except Exception as exc:  # BuildSourceError, ou donnée corrompue
+            log.warning("Rôles des champions indisponibles (%s)", exc)
+            return {}
 
     def champion_roles(self, champion: str) -> list[str]:
         """Rôles suivis pour le champion (même règle que le prefetch)."""
-        rates = self.roles().get(champion) or {}
+        rates = self._roles_or_empty().get(champion) or {}
         if not rates:
             return []
         main = max(rates, key=rates.get)
@@ -127,11 +158,14 @@ class LiveBuilds:
     def role_for(self, champion: str, position: str) -> str | None:
         if position in ROLES:
             return position
-        rates = self.roles().get(champion)
+        rates = self._roles_or_empty().get(champion)
         return max(rates, key=rates.get) if rates else None
 
     def guess_opponent(self, enemies: list[str], my_role: str) -> str | None:
-        lanes = guess_lanes(enemies, self.roles())
+        roles = self._roles_or_empty()
+        if not roles:
+            return None
+        lanes = guess_lanes(enemies, roles)
         return next((champ for champ, role in lanes.items() if role == my_role), None)
 
     # ------------------------------------------------------------------ téléchargement de tous les builds
@@ -174,7 +208,7 @@ class LiveBuilds:
             self.cache.save(build)
             log.info("OP.GG : build %s %s récupéré", champion, role)
             return build
-        except (BuildSourceError, ValueError, OSError) as exc:
+        except Exception as exc:  # une réponse bizarre ne doit jamais perdre l'ancien cache
             log.warning("OP.GG : build %s %s indisponible (%s)", champion, role, exc)
             return self.cache.load(champion, role)
 
@@ -183,14 +217,14 @@ class LiveBuilds:
         today = date.today().isoformat()
         path = self.dir / "matchups" / f"{champion}_{role}_vs_{opponent}.json"
         cached = _read(path)
-        if cached and cached.get("date") == today:
+        if cached and cached.get("date") == today and cached.get("variants") is not None:
             return cached["variants"]
         try:
             with self._lock:
                 variants, insight = self.source.fetch_matchup(champion, role, opponent, insight=True)
-        except BuildSourceError as exc:
+        except Exception as exc:
             log.warning("OP.GG : matchup %s vs %s indisponible (%s)", champion, opponent, exc)
-            return cached["variants"] if cached else []
+            return (cached or {}).get("variants") or []
         _write(path, {"date": today, "variants": variants, "insight": insight})
         log.info("OP.GG : %s %s vs %s, %d propositions", champion, role, opponent, len(variants))
         return variants
@@ -209,14 +243,14 @@ class LiveBuilds:
         today = date.today().isoformat()
         path = self.dir / "opgg" / f"tier_{role}.json"
         cached = _read(path)
-        if cached and cached.get("date") == today:
+        if cached and cached.get("date") == today and cached.get("tiers") is not None:
             return cached["tiers"]
         try:
             with self._lock:
                 tiers = self.source.fetch_tier_list(role)
-        except BuildSourceError as exc:
+        except Exception as exc:
             log.warning("OP.GG : tier list %s indisponible (%s)", role, exc)
-            return cached["tiers"] if cached else []
+            return (cached or {}).get("tiers") or []
         _write(path, {"date": today, "tiers": tiers})
         return tiers
 
@@ -225,37 +259,40 @@ class LiveBuilds:
         today = date.today().isoformat()
         path = self.dir / "counters" / f"{enemy}_{role}.json"
         cached = _read(path)
-        if cached and cached.get("date") == today:
+        if cached and cached.get("date") == today and cached.get("counters") is not None:
             return cached["counters"]
         try:
             with self._lock:
                 counters = self.source.fetch_counters(enemy, role)
-        except BuildSourceError as exc:
+        except Exception as exc:
             log.warning("OP.GG : counters de %s indisponibles (%s)", enemy, exc)
-            return cached["counters"] if cached else []
+            return (cached or {}).get("counters") or []
         _write(path, {"date": today, "counters": counters})
         log.info("OP.GG : %d picks évalués contre %s %s", len(counters), enemy, role)
         return counters
 
+    def _memo(self, store: dict[tuple[str, str, str], tuple[float, Any]], key: tuple[str, str, str], tool: str,
+              arguments: dict[str, Any]) -> Any:
+        hit = store.get(key)
+        if hit and time.monotonic() - hit[0] < PLAYER_TTL:
+            return hit[1]
+        value = self._player_call(tool, arguments)
+        store[key] = (time.monotonic(), value)
+        return value
+
     def player_profile(self, game_name: str, tag: str, region: str) -> Any:
-        """Profil OP.GG d'un joueur (gardé en mémoire le temps de la session de l'appli)."""
-        key = (game_name.lower(), tag.lower(), region)
-        if key not in self._profiles:
-            self._profiles[key] = self._player_call("lol_get_summoner_profile", {
-                "game_name": game_name, "tag_line": tag, "region": region, "lang": "en_US",
-                "desired_output_fields": PROFILE_FIELDS,
-            })
-        return self._profiles[key]
+        """Profil OP.GG d'un joueur (gardé en mémoire PLAYER_TTL secondes)."""
+        return self._memo(self._profiles, (game_name.lower(), tag.lower(), region), "lol_get_summoner_profile", {
+            "game_name": game_name, "tag_line": tag, "region": region, "lang": "en_US",
+            "desired_output_fields": PROFILE_FIELDS,
+        })
 
     def player_matches(self, game_name: str, tag: str, region: str) -> Any:
-        """Dernières parties d'un joueur (gardées en mémoire le temps de la session de l'appli)."""
-        key = (game_name.lower(), tag.lower(), region)
-        if key not in self._matches:
-            self._matches[key] = self._player_call("lol_list_summoner_matches", {
-                "game_name": game_name, "tag_line": tag, "region": region, "lang": "en_US", "limit": 10,
-                "desired_output_fields": MATCH_FIELDS,
-            })
-        return self._matches[key]
+        """Dernières parties d'un joueur (gardées en mémoire PLAYER_TTL secondes)."""
+        return self._memo(self._matches, (game_name.lower(), tag.lower(), region), "lol_list_summoner_matches", {
+            "game_name": game_name, "tag_line": tag, "region": region, "lang": "en_US", "limit": 10,
+            "desired_output_fields": MATCH_FIELDS,
+        })
 
     def _player_call(self, tool: str, arguments: dict[str, Any]) -> Any:
         """Appel OP.GG sur l'une des sessions réservées aux joueurs (attend qu'une se libère)."""
@@ -279,13 +316,22 @@ class LiveBuilds:
 
 def _read(path: Path) -> dict[str, Any] | None:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    return data if isinstance(data, dict) else None  # un JSON valide mais pas un objet = fichier corrompu
 
 
 def _write(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    """Écriture atomique ; un disque plein ou en lecture seule ne doit pas faire échouer la requête."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")  # unique par thread
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.warning("Écriture impossible %s : %s", path.name, exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass

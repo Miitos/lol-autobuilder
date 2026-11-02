@@ -86,7 +86,10 @@ def merge_item_sets(existing: dict[str, Any], new_set: dict[str, Any]) -> dict[s
     """
     payload = dict(existing)
     kept = [s for s in existing.get("itemSets", []) if not str(s.get("title", "")).startswith(AUTO_PREFIX)]
-    payload["itemSets"] = [*kept, new_set]
+    # Le jeu trie par sortrank décroissant et présélectionne le premier : le nôtre passe devant ceux des autres applis.
+    ranks = [r for r in (s.get("sortrank") for s in kept) if isinstance(r, int | float)]
+    first = {**new_set, "sortrank": int(max(ranks, default=0)) + 1}
+    payload["itemSets"] = [first, *kept]
     return payload
 
 

@@ -15,11 +15,13 @@ Les réponses ne sont pas du JSON mais un format compact :
 from __future__ import annotations
 
 import ast
+import functools
 import json
 import logging
 import re
 import time
 from collections import Counter
+from datetime import date
 from collections.abc import Iterable
 from typing import Any
 
@@ -126,10 +128,15 @@ class OpggClient:
                 if self.session_id is None:
                     self._initialize()
                 result = self._rpc("tools/call", {"name": tool, "arguments": arguments})
-                text = "".join(c.get("text", "") for c in result.get("content", []) if c.get("type") == "text")
+                content = result.get("content") or []
+                text = "".join(str(c.get("text") or "") for c in content
+                               if isinstance(c, dict) and c.get("type") == "text")
                 if result.get("isError"):
                     raise BuildSourceError(f"{tool} : {text[:200]}")
-                return json.loads(text) if text.lstrip().startswith("{") else parse_toon(text)
+                try:
+                    return json.loads(text) if text.lstrip().startswith("{") else parse_toon(text)
+                except (ValueError, TypeError, RecursionError, MemoryError) as exc:  # corps illisible
+                    raise BuildSourceError(f"{tool} : réponse OP.GG illisible ({exc})") from exc
             except _Retry as exc:
                 if attempt == retries:
                     raise BuildSourceError(f"OP.GG indisponible : {exc}") from exc
@@ -145,8 +152,8 @@ class OpggClient:
             "protocolVersion": PROTOCOL_VERSION, "capabilities": {},
             "clientInfo": {"name": "lolbuilds", "version": "0.1"},
         }})
+        self._decode(resp)  # lève si l'initialisation a échoué : pas de session_id bidon gardé
         self.session_id = resp.headers.get("mcp-session-id")
-        self._decode(resp)
         self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
     def _rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -165,7 +172,7 @@ class OpggClient:
             raise _Retry(str(exc)) from exc
         finally:
             self._last = time.monotonic()
-        if resp.status_code in (404, 400) and self.session_id:
+        if resp.status_code == 404 and self.session_id:  # seul 404 = session expirée ; un 400 est une vraie erreur
             raise _Retry(f"session expirée ({resp.status_code})", reset_session=True)
         if resp.status_code == 429 or resp.status_code >= 500:
             raise _Retry(f"HTTP {resp.status_code}")
@@ -180,10 +187,21 @@ class OpggClient:
         text = resp.text
         if "text/event-stream" in resp.headers.get("content-type", ""):
             text = "\n".join(line[5:].strip() for line in text.splitlines() if line.startswith("data:"))
-        msg = json.loads(text)
-        if "error" in msg:
-            raise BuildSourceError(f"OP.GG : {msg['error'].get('message', msg['error'])}")
-        return msg.get("result", {})
+        try:
+            msg = json.loads(text)
+        except ValueError as exc:  # corps HTML, tronqué...
+            raise BuildSourceError(f"OP.GG : réponse non JSON ({text[:100]!r})") from exc
+        if not isinstance(msg, dict):
+            raise BuildSourceError(f"OP.GG : réponse inattendue ({text[:100]!r})")
+        if msg.get("error"):
+            err = msg["error"]
+            raise BuildSourceError(f"OP.GG : {err.get('message', err) if isinstance(err, dict) else err}")
+        result = msg.get("result")
+        if result is None:
+            return {}
+        if not isinstance(result, dict):
+            raise BuildSourceError(f"OP.GG : résultat inattendu ({str(result)[:100]!r})")
+        return result
 
     def _next_id(self) -> int:
         self._id += 1
@@ -205,7 +223,8 @@ def lane_roles(meta: Any, champions: ChampionCatalog) -> dict[str, dict[str, flo
     for pos, entries in positions.items():
         role = FROM_OPGG.get(pos)
         for e in entries or []:
-            champ = champions.resolve(str(e.get("champion", "")))
+            e = e or {}
+            champ = champions.resolve(str(e.get("champion") or ""))
             if role and champ:
                 roles.setdefault(champ, {})[role] = float(e.get("role_rate") or 0)
             elif role:
@@ -219,7 +238,7 @@ def _wr(stat: dict[str, Any]) -> float:
 
 
 def _title(label: str, stat: dict[str, Any]) -> str:
-    return f"{label} ({_wr(stat):.0%} WR, {stat.get('play', 0)} parties)"
+    return f"{label} ({_wr(stat):.0%} WR, {stat.get('play') or 0} parties)"
 
 
 def _block(key: str, title: str, item_ids: Iterable[int]) -> dict[str, Any]:
@@ -230,7 +249,7 @@ def _block(key: str, title: str, item_ids: Iterable[int]) -> dict[str, Any]:
 def _describe(stat: dict[str, Any] | None) -> dict[str, Any] | None:
     if not stat:
         return None
-    return {"games": stat.get("play", 0), "winrate": _wr(stat), "pick_rate": stat.get("pick_rate", 0), "fallback": False}
+    return {"games": stat.get("play") or 0, "winrate": _wr(stat), "pick_rate": stat.get("pick_rate") or 0, "fallback": False}
 
 
 def _variant(runes: dict[str, Any], spells: dict[str, Any], *, starter: dict[str, Any] | None,
@@ -244,7 +263,7 @@ def _variant(runes: dict[str, Any], spells: dict[str, Any], *, starter: dict[str
         blocks.append(_block("core", _title("Core", core), core["ids"]))
     if boots and boots.get("ids"):
         blocks.append(_block("boots", _title("Bottes", boots), boots["ids"]))
-    excluded = set(core.get("ids", []) if core else ()) | set(boots.get("ids", []) if boots else ())
+    excluded = set((core or {}).get("ids") or ()) | set((boots or {}).get("ids") or ())
     situ = list(dict.fromkeys(i for i in situational if i not in excluded))[:6]
     if situ:
         blocks.append(_block("situational", "Situationnel", situ))
@@ -252,12 +271,13 @@ def _variant(runes: dict[str, Any], spells: dict[str, Any], *, starter: dict[str
     return {
         "primaryStyle": runes.get("primary_page_id"),
         "subStyle": runes.get("secondary_page_id"),
-        "perks": [*runes.get("primary_rune_ids", []), *runes.get("secondary_rune_ids", []), *runes.get("stat_mod_ids", [])],
-        "spells": list(spells.get("ids", []))[:2],
+        "perks": [*(runes.get("primary_rune_ids") or []), *(runes.get("secondary_rune_ids") or []),
+                  *(runes.get("stat_mod_ids") or [])],
+        "spells": list(spells.get("ids") or [])[:2],
         "blocks": blocks,
-        "games": runes.get("play", 0),
+        "games": runes.get("play") or 0,
         "winrate": _wr(runes),
-        "pick_rate": runes.get("pick_rate", 0),
+        "pick_rate": runes.get("pick_rate") or 0,
         "tags": tags,
         "details": {
             "runes": _describe(runes),
@@ -285,15 +305,15 @@ def build_from_analysis(analysis: Any, *, champion: str, champion_id: int, role:
     if not runes or not spells:
         raise InsufficientDataError(f"{champion} {role} : pas de runes/sorts sur OP.GG")
     situational = [i for key in ("fourth_items", "fifth_items", "sixth_items")
-                   for option in data.get(key) or [] for i in option.get("ids", [])]
+                   for option in data.get(key) or [] for i in (option or {}).get("ids") or []]
     variant = _variant(runes, spells, starter=data.get("starter_items"), core=data.get("core_items"),
                        boots=data.get("boots"), situational=situational,
-                       skills=(data.get("skills") or {}).get("order", []),
+                       skills=(data.get("skills") or {}).get("order") or [],
                        tags=["Build ARAM"] if role == ARAM else ["Recommandé OP.GG"])
     # Stats du champion dans CE rôle ; `average_stats` couvre tous ses rôles confondus.
     summary_raw = data.get("summary") or {}
-    summary = next((p.get("stats") or {} for p in summary_raw.get("positions") or []
-                    if str(p.get("name", "")).lower() == TO_OPGG.get(role)), None) or summary_raw.get("average_stats") or {}
+    summary = next(((p or {}).get("stats") or {} for p in summary_raw.get("positions") or []
+                    if str((p or {}).get("name") or "").lower() == TO_OPGG.get(role)), None) or summary_raw.get("average_stats") or {}
     label = f"{champion} {ROLE_LABELS.get(role, role)}"
     build = Build(
         champion=champion,
@@ -318,8 +338,8 @@ def build_from_analysis(analysis: Any, *, champion: str, champion_id: int, role:
         details=variant["details"],
         variants=[variant],
         spell_options=[{
-            "spells": variant["spells"], "games": spells.get("play", 0), "winrate": _wr(spells),
-            "pick_rate": spells.get("pick_rate", 0), "most_played": True,
+            "spells": variant["spells"], "games": spells.get("play") or 0, "winrate": _wr(spells),
+            "pick_rate": spells.get("pick_rate") or 0, "most_played": True,
         }],
     )
     build.validate()
@@ -332,7 +352,7 @@ MATCHUP_MIN_GAMES = 50
 
 def _best(options: list[dict[str, Any]] | None) -> dict[str, Any] | None:
     """Meilleur winrate parmi les options assez jouées, sinon la plus jouée."""
-    options = [o for o in options or [] if o.get("play")]
+    options = [o for o in options or [] if o and o.get("play")]
     if not options:
         return None
     eligible = [o for o in options if (o.get("pick_rate") or 0) >= MATCHUP_MIN_PICK and o["play"] >= MATCHUP_MIN_GAMES]
@@ -352,28 +372,29 @@ def matchup_variants(guide: Any, *, opponent: str, items: ItemCatalog | None = N
     data = (guide or {}).get("data") or {}
     groups: dict[tuple[Any, ...], dict[str, Any]] = {}
     for page in data.get("runes") or []:
+        page = page or {}
         ids = page.get("primary_rune_ids") or []
         if len(ids) != 4 or len(page.get("secondary_rune_ids") or []) != 2 or len(page.get("stat_mod_ids") or []) != 3:
             continue
         key = (page.get("primary_page_id"), ids[0], page.get("secondary_page_id"))
-        if key not in groups or page.get("play", 0) > groups[key].get("play", 0):
+        if key not in groups or (page.get("play") or 0) > (groups[key].get("play") or 0):
             groups[key] = page
-    pages = sorted(groups.values(), key=lambda p: p.get("play", 0), reverse=True)
+    pages = sorted(groups.values(), key=lambda p: p.get("play") or 0, reverse=True)
     spells = _best(data.get("summoner_spells"))
     if not pages or not spells:
         return []
     most_played = pages[0]
-    eligible = [p for p in pages if (p.get("pick_rate") or 0) >= MATCHUP_MIN_PICK and p.get("play", 0) >= MATCHUP_MIN_GAMES]
+    eligible = [p for p in pages if (p.get("pick_rate") or 0) >= MATCHUP_MIN_PICK and (p.get("play") or 0) >= MATCHUP_MIN_GAMES]
     chosen = sorted(eligible, key=lambda p: (_wr(p), p["play"]), reverse=True)[:max_variants]
     if most_played not in chosen:
         chosen = [*chosen[: max_variants - 1], most_played]
-        chosen.sort(key=lambda p: (_wr(p), p.get("play", 0)), reverse=True)
+        chosen.sort(key=lambda p: (_wr(p), p.get("play") or 0), reverse=True)
 
     def completed(iid: int) -> bool:
         return not items or not items.items or items.is_completed(iid)
 
-    situational = [i for option in data.get("last_items") or [] for i in option.get("ids", []) if completed(i)]
-    skills = ((data.get("skills") or [{}])[0] or {}).get("order", [])
+    situational = [i for option in data.get("last_items") or [] for i in (option or {}).get("ids") or [] if completed(i)]
+    skills = (((data.get("skills") or [{}])[0]) or {}).get("order") or []
     variants = []
     for page in chosen:
         tags = [f"Contre {opponent}"] + (["Le plus joué"] if page is most_played and len(chosen) > 1 else [])
@@ -399,7 +420,8 @@ def tier_list(meta: Any, champions: ChampionCatalog, role: str) -> list[dict[str
     entries = (((meta or {}).get("data") or {}).get("positions") or {}).get(TO_OPGG.get(role, ""), []) or []
     result = []
     for e in entries:
-        champ = champions.resolve(str(e.get("champion", "")))
+        e = e or {}
+        champ = champions.resolve(str(e.get("champion") or ""))
         if not champ:
             continue
         result.append({
@@ -419,6 +441,7 @@ def counters_from_guide(guide: Any) -> list[dict[str, Any]]:
     """
     result = []
     for c in ((guide or {}).get("data") or {}).get("counters") or []:
+        c = c or {}
         play, win = c.get("play") or 0, c.get("win") or 0
         if play and c.get("champion_id"):
             result.append({"championId": int(c["champion_id"]), "games": play, "winrate": round(1 - win / play, 4)})
@@ -426,6 +449,19 @@ def counters_from_guide(guide: Any) -> list[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------- source
+
+def _guarded(fn):
+    """Une réponse mal formée ne doit jamais sortir en KeyError/TypeError : on la ramène à BuildSourceError."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except BuildSourceError:
+            raise
+        except (KeyError, TypeError, AttributeError, ValueError, IndexError) as exc:
+            raise BuildSourceError(f"{fn.__name__} : réponse OP.GG inexploitable ({type(exc).__name__}: {exc})") from exc
+    return wrapper
+
 
 class OpggSource(BuildSource):
     name = "opgg"
@@ -435,18 +471,24 @@ class OpggSource(BuildSource):
         self.settings = settings
         self.client = client or OpggClient(settings.request_interval)
         self._roles: dict[str, dict[str, float]] | None = None
+        self._roles_date = ""
 
+    @_guarded
     def roles(self) -> dict[str, dict[str, float]]:
-        """Rôles joués par champion (un seul appel, mis en mémoire)."""
-        if self._roles is None:
+        """Rôles joués par champion (un seul appel par jour, mis en mémoire)."""
+        today = date.today().isoformat()
+        if self._roles is None or self._roles_date != today:  # le process peut passer minuit
+            self._roles = None
             meta = self.client.call("lol_list_lane_meta_champions", {
                 "position": "all", "lang": "en_US",
                 "desired_output_fields": META_FIELDS,
             })
             self._roles = lane_roles(meta, self.static.champions)
+            self._roles_date = today
             log.info("OP.GG : %d champions dans la méta des lanes", len(self._roles))
         return self._roles
 
+    @_guarded
     def targets(self) -> list[Target]:
         """Tous les champions, dans chaque rôle joué au moins `min_role_rate` (et toujours le principal)."""
         result: set[Target] = set()
@@ -467,6 +509,7 @@ class OpggSource(BuildSource):
         """Un build ARAM par champion (pas de lane en ARAM), si l'option `aram` est active."""
         return [Target(champ, ARAM) for champ in sorted(set(champions))] if self.settings.aram else []
 
+    @_guarded
     def fetch_build(self, champion: str, role: str) -> Build:
         if role == ARAM:
             return self._fetch_aram(champion)
@@ -505,6 +548,7 @@ class OpggSource(BuildSource):
         return build_from_analysis(analysis, champion=champion, champion_id=champion_id, role=ARAM,
                                    patch=self.static.patch)
 
+    @_guarded
     def fetch_matchup(self, champion: str, role: str, opponent: str, insight: bool = False) -> Any:
         """Propositions de `champion` contre `opponent` (ids Data Dragon) dans le rôle donné.
 
@@ -520,6 +564,7 @@ class OpggSource(BuildSource):
         variants = matchup_variants(guide, opponent=names.get(opponent, opponent), items=self.static.items)
         return (variants, matchup_insight(guide)) if insight else variants
 
+    @_guarded
     def fetch_tier_list(self, role: str) -> list[dict[str, Any]]:
         """Tier list OP.GG du rôle (les champions les plus forts en premier)."""
         if role not in TO_OPGG:
@@ -531,6 +576,7 @@ class OpggSource(BuildSource):
         })
         return tier_list(meta, self.static.champions, role)
 
+    @_guarded
     def fetch_counters(self, enemy: str, role: str) -> list[dict[str, Any]]:
         """Winrate de chaque champion contre `enemy` dans ce rôle (meilleurs picks en premier)."""
         if role not in TO_OPGG:

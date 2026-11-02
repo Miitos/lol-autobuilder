@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from datetime import date
 from pathlib import Path
 
@@ -36,7 +37,7 @@ class BuildCache:
             return None
         try:
             return Build.from_dict(json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, ValueError, TypeError) as exc:
+        except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:  # JSON valide mais pas un build
             log.warning("Cache illisible %s : %s", path.name, exc)
             return None
 
@@ -48,9 +49,13 @@ class BuildCache:
     def save(self, build: Build) -> Path:
         build.validate()
         path = self.path_for(build.champion, build.role)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(build.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")  # unique par thread
+        try:
+            tmp.write_text(json.dumps(build.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
         return path
 
     def build_paths(self) -> list[Path]:

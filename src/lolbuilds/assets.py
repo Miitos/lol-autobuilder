@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 
-from .ddragon import DDRAGON
+from .ddragon import DDRAGON, atomic_write
 
 log = logging.getLogger(__name__)
 
@@ -76,7 +76,12 @@ class AssetStore:
         self.cache_dir = cache_dir
         self.root = cache_dir / "assets"
         self.ui_file = cache_dir / "ui_static.json"
+        self._own_http = http is None
         self.http = http or httpx.Client(timeout=30)
+
+    def close(self) -> None:
+        if self._own_http:
+            self.http.close()
 
     def ensure(self, version: str, splash_for: list[str] | None = None) -> dict[str, Any]:
         """Télécharge les JSON fr_FR et les images manquantes ; écrit `ui_static.json`.
@@ -90,10 +95,14 @@ class AssetStore:
         for name in UI_FILES:
             path = vdir / name
             if not path.exists():
-                path.write_bytes(self._get(f"{DDRAGON}/cdn/{version}/data/{LANG}/{name}"))
-            raw[name] = json.loads(path.read_text(encoding="utf-8"))
+                atomic_write(path, self._get(f"{DDRAGON}/cdn/{version}/data/{LANG}/{name}"))
+            try:
+                raw[name] = json.loads(path.read_text(encoding="utf-8"))
+            except ValueError:  # fichier corrompu : retéléchargé au prochain passage
+                path.unlink(missing_ok=True)
+                raise
         ui = build_ui_static(version, raw)
-        self.ui_file.write_text(json.dumps(ui, ensure_ascii=False), encoding="utf-8")
+        atomic_write(self.ui_file, json.dumps(ui, ensure_ascii=False))
 
         jobs: list[tuple[str, Path]] = []
         cdn = f"{DDRAGON}/cdn/{version}/img"
@@ -131,5 +140,8 @@ class AssetStore:
         except httpx.HTTPError as exc:
             log.debug("Asset introuvable %s : %s", url, exc)
             return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write(path, data)  # atomique : pas d'image tronquée prise pour valide
+        except OSError as exc:
+            log.warning("Asset non écrit %s : %s", path.name, exc)

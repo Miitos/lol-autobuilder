@@ -151,3 +151,32 @@ def test_version_matches_pyproject():
 
     pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
     assert tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"] == __version__
+
+
+def test_program_files_install_is_manual(tmp_path, monkeypatch):
+    # Ancienne installation « tous les utilisateurs » : pas de mise à jour automatique (pas de droits admin).
+    pf = tmp_path / "Program Files"
+    (pf / "lolbuilds").mkdir(parents=True)
+    exe = pf / "lolbuilds" / "lolbuilds.exe"
+    (pf / "lolbuilds" / "unins000.exe").write_bytes(b"")
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(updater.sys, "executable", str(exe))
+    monkeypatch.setenv("ProgramFiles", str(pf))
+    assert updater.mode() is None
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "ailleurs"))
+    monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+    monkeypatch.delenv("ProgramW6432", raising=False)
+    assert updater.mode() == "installer"
+
+
+def test_failed_download_removes_partial_file(tmp_path):
+    def handler(request):
+        if request.url.path == "/sums":
+            return httpx.Response(200, text="abc  lolbuilds-portable-0.2.0.exe\n")
+        raise httpx.ReadError("coupé")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    info = {"portable": {"name": "lolbuilds-portable-0.2.0.exe", "url": "https://dl/p.exe"}, "sums": "https://dl/sums"}
+    with pytest.raises(updater.UpdateError):
+        updater.download_portable(info, tmp_path, http=client)
+    assert not list(tmp_path.glob("*.download"))

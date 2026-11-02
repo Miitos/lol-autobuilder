@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,20 @@ log = logging.getLogger(__name__)
 
 DDRAGON = "https://ddragon.leagueoflegends.com"
 FILES = ("champion.json", "item.json", "runesReforged.json", "summoner.json")
+
+
+def atomic_write(path: Path, data: bytes | str) -> None:
+    """Écrit via un fichier temporaire unique puis `os.replace` : jamais de fichier tronqué."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        if isinstance(data, str):
+            tmp.write_text(data, encoding="utf-8")
+        else:
+            tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def patch_of(version: str) -> str:
@@ -134,7 +150,13 @@ class DataDragon:
     def __init__(self, cache_dir: Path, http: httpx.Client | None = None) -> None:
         self.dir = cache_dir / "ddragon"
         self.static_file = cache_dir / "static.json"
+        self._own_http = http is None
         self.http = http or httpx.Client(timeout=30)
+
+    def close(self) -> None:
+        """Ferme le client httpx s'il a été créé ici."""
+        if self._own_http:
+            self.http.close()
 
     def latest_version(self) -> str:
         resp = self.http.get(f"{DDRAGON}/api/versions.json")
@@ -153,24 +175,28 @@ class DataDragon:
                 log.info("Data Dragon %s : téléchargement de %s", version, name)
                 resp = self.http.get(f"{DDRAGON}/cdn/{version}/data/en_US/{name}")
                 resp.raise_for_status()
-                path.write_bytes(resp.content)
-            raw[name] = json.loads(path.read_text(encoding="utf-8"))
+                atomic_write(path, resp.content)
+            try:
+                raw[name] = json.loads(path.read_text(encoding="utf-8"))
+            except ValueError:  # fichier corrompu : on le retélécharge au prochain passage
+                path.unlink(missing_ok=True)
+                raise
         static = build_static(version, raw)
         # Fichier compact lu hors-ligne par le client champ select.
-        self.static_file.write_text(
-            json.dumps({"version": version, "champions": static.champions.to_dict()}), encoding="utf-8"
-        )
+        atomic_write(self.static_file, json.dumps({"version": version, "champions": static.champions.to_dict()}))
         return static
 
     def load_cached(self) -> StaticData | None:
         """Dernière version en cache, sans réseau (secours si Data Dragon est injoignable)."""
-        if not self.static_file.exists():
+        try:
+            version = json.loads(self.static_file.read_text(encoding="utf-8"))["version"]
+            vdir = self.dir / version
+            if not all((vdir / n).exists() for n in FILES):
+                return None
+            return build_static(version, {n: json.loads((vdir / n).read_text(encoding="utf-8")) for n in FILES})
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            log.warning("Cache Data Dragon illisible : %s", exc)
             return None
-        version = json.loads(self.static_file.read_text(encoding="utf-8"))["version"]
-        vdir = self.dir / version
-        if not all((vdir / n).exists() for n in FILES):
-            return None
-        return build_static(version, {n: json.loads((vdir / n).read_text(encoding="utf-8")) for n in FILES})
 
 
 def build_static(version: str, raw: dict[str, Any]) -> StaticData:
@@ -191,7 +217,8 @@ def build_static(version: str, raw: dict[str, Any]) -> StaticData:
 
 def load_champion_catalog(cache_dir: Path) -> ChampionCatalog | None:
     """Catalogue des champions pour le champ select (lecture seule, hors-ligne)."""
-    path = cache_dir / "static.json"
-    if not path.exists():
+    try:
+        data = json.loads((cache_dir / "static.json").read_text(encoding="utf-8"))
+        return ChampionCatalog.from_dict(data["champions"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
-    return ChampionCatalog.from_dict(json.loads(path.read_text(encoding="utf-8"))["champions"])

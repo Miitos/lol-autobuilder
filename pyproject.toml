@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lolbuilds"
-version = "0.5.4"
+version = "0.5.5"
 description = "Import automatique de builds LoL (runes, sorts, item set) en champ select, depuis un cache local rempli la nuit via OP.GG."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,7 +27,7 @@ lolbuilds-app = "lolbuilds.app.main:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"lolbuilds.app" = ["ui/*", "ui/fonts/*"]
+"lolbuilds.app" = ["ui/*", "ui/fonts/*", "ui/audio/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

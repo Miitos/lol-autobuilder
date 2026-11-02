@@ -46,7 +46,7 @@ def refresh_one(cache: BuildCache, source: BuildSource, target: Target, today: d
         cache.save(build)
         log.info("%s %s : %d parties, %.1f %% WR", target.champion, target.role, build.sample_size, build.winrate * 100)
         return Outcome.UPDATED
-    except (BuildSourceError, ValueError, OSError) as exc:
+    except Exception as exc:  # un champion défectueux ne doit jamais interrompre tout le prefetch
         old = cache.load(target.champion, target.role)
         if old:
             log.warning("%s %s : %s -> build du %s conservé", target.champion, target.role, exc, old.fetched_at)
@@ -82,14 +82,19 @@ def load_static(cfg: Config) -> StaticData | None:
     except Exception as exc:  # réseau, JSON...
         log.error("Data Dragon injoignable (%s), utilisation de la version en cache", exc)
         return dd.load_cached()
+    finally:
+        dd.close()
 
 
 def update_ui_assets(cfg: Config, static: StaticData, cache: BuildCache) -> None:
     """Images et textes fr de l'interface ; un échec ici ne bloque jamais les builds."""
+    store = AssetStore(cfg.cache_dir)
     try:
-        AssetStore(cfg.cache_dir).ensure(static.version)
+        store.ensure(static.version)
     except Exception as exc:
         log.warning("Assets de l'interface non mis à jour : %s", exc)
+    finally:
+        store.close()
 
 
 def run(args: argparse.Namespace) -> int:

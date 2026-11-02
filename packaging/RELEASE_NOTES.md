@@ -1,6 +1,17 @@
 ## Nouveautés
 
-- **Disco pick** : plus de compte à rebours. Dès que la roulette s'arrête, le champion tiré est verrouillé, puis son build (une proposition OP.GG au hasard ou la plus jouée, selon tes réglages) et tes sorts sont envoyés au client.
+- **ARAM** : tes alliés et tes adversaires s'affichent maintenant en partie (ils restaient « en attente »). Le Disco pick n'apparaît plus en ARAM.
+- **Disco pick** : le champion tiré n'est envoyé à League qu'à l'arrêt de la roulette, qui le verrouille. S'il reste moins de 5 secondes, la roulette passe en turbo.
+- **Champ select plus fiable** :
+  - un champion survolé pendant ton tour n'est plus pris pour un champion verrouillé ;
+  - un échange de champion avec un allié applique le bon build ;
+  - consulter un autre rôle ne remplace plus ton build ;
+  - deux applications ne se chevauchent plus (item sets écrasés) ;
+  - une panne d'OP.GG ne bloque plus l'affichage.
+- **Build atypique en option** : la proposition « Atypique : build ARAM » des parties normales est désactivée par défaut. Pour la retrouver : Réglages › Champ select.
+- **Item set en premier** : l'item set de lolbuilds passe devant ceux des autres applis dans la boutique, donc c'est lui que le jeu présélectionne.
+- **Arena et autres modes** : les builds de la Faille sont affichés mais jamais appliqués tout seuls.
+- **Installation et portable** : plus de seconde fenêtre lolbuilds au relancement. Un `config.toml` invalide est signalé au lieu d'empêcher le démarrage. La désinstallation ferme lolbuilds s'il est ouvert.
 
 ## Mettre à jour
 
